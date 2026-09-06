@@ -1,0 +1,9 @@
+{
+  "name": "dom-limit-spike",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "serve": "node scripts/serve.mjs",
+    "measure": "node scripts/measure.mjs"
+  }
+}

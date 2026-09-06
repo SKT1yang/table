@@ -1,0 +1,50 @@
+{
+  "mount": {
+    "rows": 1000,
+    "chunkSize": 1000,
+    "chunks": 1,
+    "firstChunkMs": 57.1,
+    "fullMs": 57.1,
+    "workMs": 57.1,
+    "chunkP50Ms": 57.1,
+    "chunkP95Ms": 57.1,
+    "chunkMaxMs": 57.1,
+    "reflowMs": 0
+  },
+  "scroll": [
+    {
+      "name": "wheel-like +400px/f",
+      "frames": 86,
+      "assigns": 0,
+      "mounts": 0
+    },
+    {
+      "name": "drag-like +17500px/f",
+      "frames": 2,
+      "assigns": 0,
+      "mounts": 0
+    }
+  ],
+  "edit": {
+    "executeMs": 72.9,
+    "textUpdateMs": 95
+  },
+  "checks": {
+    "visibleText": true,
+    "collapseRestore": false,
+    "expandVisible": false,
+    "expandAnchor": false,
+    "editCount": true,
+    "editText": true,
+    "undoText": true,
+    "undoCount": true,
+    "subsStable": true,
+    "subsMatchActive": true,
+    "mountsStable": true
+  },
+  "subs": 20000,
+  "subsExpected": 20000,
+  "mountedRows": 1000,
+  "domNodes": 23066,
+  "pass": false
+}

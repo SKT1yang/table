@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>纯 HTML 表格 — DOM 极限</title>
+<style>
+  /* 零依赖、零框架：本文件即全部。所有 bench 函数挂 window.__bench 供 CDP 驱动。 */
+  html, body { margin: 0; height: 100%; font: 12px/1.45 system-ui, -apple-system, sans-serif; color: #333; background: #fafafa; }
+  .bar { position: relative; z-index: 5; display: flex; gap: 6px; align-items: center; padding: 6px 10px;
+         background: #fff; border-bottom: 1px solid #ddd; flex-wrap: wrap; }
+  .bar label { display: flex; gap: 3px; align-items: center; color: #666; }
+  .bar button { font: inherit; padding: 2px 8px; border: 1px solid #bbb; background: #fff; border-radius: 4px; cursor: pointer; }
+  .bar button:hover { background: #f0f0f0; }
+  #status { color: #080; margin-left: auto; }
+  #logbox { position: absolute; z-index: 6; right: 8px; bottom: 8px; max-width: 46vw; max-height: 40vh; overflow: auto;
+            background: #fffef2; border: 1px solid #d8d8c0; border-radius: 4px; padding: 4px 8px; font-size: 11px; }
+  #log { margin: 0; white-space: pre-wrap; word-break: break-all; }
+  .stage { position: absolute; top: 38px; left: 0; right: 0; bottom: 0; overflow: hidden; }
+  .scroller { position: absolute; inset: 0; overflow: auto; overflow-anchor: none; }
+  .m-div .scroller, .m-virt .scroller { top: 30px; }
+
+  .vhead { position: absolute; top: 0; left: 0; right: 0; height: 30px; display: flex; background: #eee;
+           border-bottom: 1px solid #ccc; z-index: 3; }
+  .vhc { width: 120px; flex: none; padding: 0 8px; line-height: 30px; border-right: 1px solid #ddd;
+         box-sizing: border-box; font-weight: 600; }
+  .vbody { position: relative; }
+  .vrow { position: absolute; left: 0; height: 35px; display: flex; }
+  .vc { width: 120px; flex: none; padding: 0 8px; line-height: 35px; border-right: 1px solid #e8e8e8;
+        border-bottom: 1px solid #e8e8e8; background: #fff; white-space: nowrap; overflow: hidden; box-sizing: border-box; }
+  .vrow.alt .vc { background: #f6f8fa; }
+  /* content-visibility 变体：屏外行跳过渲染（样式/布局/绘制对象） */
+  .cv .vrow { content-visibility: auto; contain-intrinsic-size: auto 35px; }
+
+  table.cell-table { border-collapse: separate; border-spacing: 0; font: inherit; }
+  .cell-table th { position: sticky; top: 0; background: #eee; z-index: 2; height: 30px; padding: 0 8px;
+                   border-right: 1px solid #ddd; border-bottom: 1px solid #ccc; text-align: left; box-sizing: border-box; }
+  .cell-table td { height: 35px; padding: 0 8px; border-right: 1px solid #e8e8e8; border-bottom: 1px solid #e8e8e8;
+                   background: #fff; white-space: nowrap; }
+  .cell-table tr.alt td { background: #f6f8fa; }
+
+  /* bench 用的失效类：
+     .hot  = 只改 color（纯样式重算，无布局）
+     .hot2 = 改 padding-left（样式 + 布局；table-layout:auto 下触发全表列宽重测量）
+     .rowhot = 行级 hover（失效范围 = 单行子树，对照「失效按子树传播」） */
+  .hot td, .hot .vc { color: #c00; }
+  .hot2 td, .hot2 .vc { padding-left: 24px; }
+  .rowhot td, .rowhot .vc { color: #c00; background: #fff7cc; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <label>行 <select id="rows">
+    <option>1000</option><option>5000</option><option>10000</option>
+    <option>50000</option><option>100000</option><option>200000</option>
+  </select></label>
+  <label>列 <input id="cols" type="number" value="10" min="1" max="40" style="width:52px"></label>
+  <label>模式 <select id="mode">
+    <option value="table-fixed">table · fixed</option>
+    <option value="table-auto">table · auto</option>
+    <option value="div">div 全量</option>
+    <option value="virtual">div 虚拟化</option>
+  </select></label>
+  <label>方法 <select id="method">
+    <option value="fragment">fragment+clone</option>
+    <option value="innerHTML">innerHTML 解析</option>
+  </select></label>
+  <label><input id="cv" type="checkbox"> content-visibility</label>
+  <button id="b-build">构建</button>
+  <button data-b="cleanRead">净树读</button>
+  <button data-b="styleHot">样式失效</button>
+  <button data-b="styleLayout">样式+布局</button>
+  <button data-b="rowHover">行 hover</button>
+  <button data-b="mutateCell">改单格</button>
+  <button data-b="hitTest">命中</button>
+  <button data-b="jumpEnd">跳尾</button>
+  <button data-b="fling">fling</button>
+  <button id="b-destroy">销毁</button>
+  <span id="status"></span>
+</div>
+<div class="stage" id="stage"></div>
+<details id="logbox" open><summary>测量日志</summary><pre id="log"></pre></details>
+
+<script>
+'use strict'
+const ROW_H = 35, COL_W = 120, OVER = 5
+const $ = (s) => document.querySelector(s)
+const stage = $('#stage')
+const raf2 = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
+const stat = (a) => {
+  const b = [...a].sort((x, y) => x - y)
+  const q = (p) => +b[Math.min(b.length - 1, Math.ceil(b.length * p) - 1)].toFixed(3)
+  return { n: a.length, p50: q(0.5), p95: q(0.95), max: +b[b.length - 1].toFixed(3), sum: +a.reduce((x, y) => x + y, 0).toFixed(1) }
+}
+const timeIt = (n, fn) => { const a = []; for (let i = 0; i < n; i++) { const s = performance.now(); fn(i); a.push(performance.now() - s) } return stat(a) }
+// 单元格文本：短、含数字变化，长度接近真实业务表格
+const cellText = (i, j) => `r${i}·${(i * 31 + j * 17) % 9973}`
+const el = (tag, cls) => { const e = document.createElement(tag); if (cls) e.className = cls; return e }
+
+let COLS = 10, mode = null, scroller = null, tbody = null, vbody = null, V = null
+
+// ———————————————— 构建 ————————————————
+function destroy() {
+  stage.innerHTML = ''
+  stage.className = 'stage'
+  scroller = tbody = vbody = V = mode = null
+  window.__vGc && window.__vGc()
+}
+
+async function build(o) {
+  const { rows, cols = 10, mode: m, method = 'fragment', cv = false } = o
+  const t00 = performance.now()
+  destroy()
+  COLS = cols; mode = m
+  let genMs = 0, buildMs = 0, cvActive = false
+
+  if (m === 'table-fixed' || m === 'table-auto') {
+    stage.className = 'stage m-table'
+    scroller = el('div', 'scroller')
+    const table = el('table', 'cell-table')
+    if (m === 'table-fixed') table.style.tableLayout = 'fixed'
+    table.style.width = COLS * COL_W + 'px'
+    const thead = el('thead'), htr = el('tr')
+    for (let j = 0; j < COLS; j++) { const th = el('th'); th.textContent = 'c' + j; htr.append(th) }
+    tbody = el('tbody')
+    thead.append(htr); table.append(thead, tbody); scroller.append(table); stage.append(scroller)
+    if (method === 'innerHTML') {
+      const g0 = performance.now()
+      const chunk = new Array(rows)
+      for (let i = 0; i < rows; i++) {
+        let s = i % 2 ? '<tr class="alt">' : '<tr>'
+        for (let j = 0; j < COLS; j++) s += '<td>' + cellText(i, j) + '</td>'
+        chunk[i] = s + '</tr>'
+      }
+      const html = chunk.join('')
+      genMs = performance.now() - g0
+      const b0 = performance.now(); tbody.innerHTML = html; buildMs = performance.now() - b0
+    } else {
+      const b0 = performance.now()
+      const tpl = el('tr')
+      for (let j = 0; j < COLS; j++) tpl.append(el('td'))
+      const frag = document.createDocumentFragment()
+      for (let i = 0; i < rows; i++) {
+        const tr = tpl.cloneNode(false) // 浅克隆 tr，单元格逐个克隆（避免浅克隆共享子树）
+        const alt = i % 2
+        for (let j = 0; j < COLS; j++) { const td = tpl.children[j].cloneNode(false); td.textContent = cellText(i, j); tr.append(td) }
+        if (alt) tr.className = 'alt'
+        frag.append(tr)
+      }
+      tbody.append(frag)
+      buildMs = performance.now() - b0
+    }
+  } else if (m === 'div') {
+    stage.className = 'stage m-div'
+    const head = el('div', 'vhead')
+    for (let j = 0; j < COLS; j++) { const c = el('div', 'vhc'); c.textContent = 'c' + j; head.append(c) }
+    scroller = el('div', 'scroller')
+    vbody = el('div', 'vbody')
+    vbody.style.height = rows * ROW_H + 'px'
+    if (cv) vbody.classList.add('cv')
+    scroller.append(vbody); stage.append(head, scroller)
+    if (method === 'innerHTML') {
+      const g0 = performance.now()
+      const chunk = new Array(rows)
+      for (let i = 0; i < rows; i++) {
+        let s = `<div class="vrow${i % 2 ? ' alt' : ''}" style="top:${i * ROW_H}px">`
+        for (let j = 0; j < COLS; j++) s += '<div class="vc">' + cellText(i, j) + '</div>'
+        chunk[i] = s + '</div>'
+      }
+      const html = chunk.join('')
+      genMs = performance.now() - g0
+      const b0 = performance.now(); vbody.innerHTML = html; buildMs = performance.now() - b0
+    } else {
+      const b0 = performance.now()
+      const tpl = el('div', 'vrow')
+      for (let j = 0; j < COLS; j++) tpl.append(el('div', 'vc'))
+      const frag = document.createDocumentFragment()
+      for (let i = 0; i < rows; i++) {
+        const tr = tpl.cloneNode(false)
+        tr.className = 'vrow' + (i % 2 ? ' alt' : '')
+        tr.style.top = i * ROW_H + 'px'
+        for (let j = 0; j < COLS; j++) { const td = tpl.children[j].cloneNode(false); td.textContent = cellText(i, j); tr.append(td) }
+        frag.append(tr)
+      }
+      vbody.append(frag)
+      buildMs = performance.now() - b0
+    }
+    if (cv) cvActive = getComputedStyle(vbody.firstElementChild).contentVisibility === 'auto'
+  } else if (m === 'virtual') {
+    stage.className = 'stage m-virt'
+    const head = el('div', 'vhead')
+    for (let j = 0; j < COLS; j++) { const c = el('div', 'vhc'); c.textContent = 'c' + j; head.append(c) }
+    scroller = el('div', 'scroller')
+    vbody = el('div', 'vbody')
+    vbody.style.height = rows * ROW_H + 'px'
+    scroller.append(vbody); stage.append(head, scroller)
+    buildVirtual(rows)
+  }
+
+  // 首次布局（强制）与首帧（rAF×2 ≈ layout+paint 提交后的下一帧）
+  const l0 = performance.now(); void scroller.offsetHeight; const firstLayoutMs = performance.now() - l0
+  const p0 = performance.now(); await raf2(); const firstPaintMs = performance.now() - p0
+  // 滚到中部：命中测试/行级 bench 落在真实内容上
+  scroller.scrollTop = Math.max(0, (rows * ROW_H - scroller.clientHeight) / 2)
+  if (mode === 'virtual') vAssign(true)
+  return {
+    rows, cols: COLS, mode: m, method, cv: cvActive,
+    genMs: +genMs.toFixed(1), buildMs: +buildMs.toFixed(1),
+    firstLayoutMs: +firstLayoutMs.toFixed(1), firstPaintMs: +firstPaintMs.toFixed(1),
+    nodes: document.getElementsByTagName('*').length,
+    wallMs: +(performance.now() - t00).toFixed(1),
+  }
+}
+
+// ———————————————— 虚拟化（vanilla 行池，grid-demo rowpool 的零框架最小版） ————————————————
+function buildVirtual(rows) {
+  V = { rows, slots: [], stats: { mounts: 0, rebinds: 0, assignMs: 0 }, pend: false }
+  void scroller.offsetHeight // 拿到 clientHeight 前先定布局
+  const cap = Math.ceil(scroller.clientHeight / ROW_H) + 2 * OVER
+  const tpl = el('div', 'vrow')
+  for (let j = 0; j < COLS; j++) tpl.append(el('div', 'vc'))
+  for (let k = 0; k < cap; k++) {
+    const r = tpl.cloneNode(false)
+    for (let j = 0; j < COLS; j++) r.append(el('div', 'vc'))
+    vbody.append(r)
+    V.slots.push({ el: r, cells: r.children, rowId: -1 })
+    V.stats.mounts++
+  }
+  scroller.addEventListener('scroll', () => {
+    if (V.pend) return
+    V.pend = true
+    requestAnimationFrame(() => { V.pend = false; vAssign() })
+  }, { passive: true })
+  vAssign(true)
+}
+function vAssign(force) {
+  const st = scroller.scrollTop
+  const first = Math.max(0, Math.floor(st / ROW_H) - OVER)
+  const last = Math.min(V.rows, Math.ceil((st + scroller.clientHeight) / ROW_H) + OVER)
+  const t0 = performance.now()
+  for (let k = 0; k < V.slots.length; k++) {
+    const idx = first + k, s = V.slots[k]
+    if (idx >= last) { if (s.rowId !== -2) { s.el.style.display = 'none'; s.rowId = -2 } continue }
+    if (s.rowId !== idx || force) {
+      s.el.style.display = ''
+      s.el.style.top = idx * ROW_H + 'px'
+      s.el.className = 'vrow' + (idx % 2 ? ' alt' : '')
+      const tds = s.cells
+      for (let j = 0; j < COLS; j++) tds[j].textContent = cellText(idx, j)
+      s.rowId = idx
+      V.stats.rebinds++
+    }
+  }
+  V.stats.assignMs += performance.now() - t0
+}
+
+// ———————————————— bench（返回 stat 对象；CDP 与页面按钮共用） ————————————————
+function firstDataCell() {
+  if (mode?.startsWith('table')) return tbody.rows[10]?.cells[0]
+  const r = vbody.querySelector('.vrow:not([style*="display: none"])') ?? vbody.querySelector('.vrow')
+  return r?.children[0]
+}
+function midRowEl() {
+  if (mode?.startsWith('table')) {
+    const i = Math.floor(scroller.scrollTop / ROW_H) + 3
+    return tbody.rows[Math.min(i, tbody.rows.length - 1)]
+  }
+  if (mode === 'virtual') {
+    const idx = Math.floor(scroller.scrollTop / ROW_H) + 3
+    return V.slots.find((s) => s.rowId === idx)?.el
+  }
+  const i = Math.floor(scroller.scrollTop / ROW_H) + 3
+  return vbody.children[Math.min(i + 1, vbody.children.length - 1)] // +1 跳过可能的其他节点
+}
+const B = {
+  build, destroy,
+  // 净树上的几何读：应≈0（布局缓存命中）——验证「读贵是因为脏，不是因为大」
+  cleanRead: (n = 10) => timeIt(n, () => { void scroller.offsetHeight }),
+  // 容器类切换（后代选择器失效 = 全表/全窗口重算）+ 一次 gCS 强制 flush；纯样式路径
+  styleHot: (n = 5) => {
+    const target = firstDataCell(); if (!target) return null
+    let x = false
+    return timeIt(n, () => { scroller.classList.toggle('hot', (x = !x)); getComputedStyle(target).color })
+  },
+  // 同上但改几何属性（padding）→ 样式 + 布局；auto 表格在此触发全表列宽重测量
+  styleLayout: (n = 3) => {
+    let x = false
+    return timeIt(n, () => { scroller.classList.toggle('hot2', (x = !x)); void scroller.offsetHeight })
+  },
+  // 行级失效（hover 语义）：对照「失效范围 = 类所在子树」
+  rowHover: (n = 10) => {
+    const row = midRowEl(), cell = row?.children[0]; if (!row) return null
+    let x = false
+    return timeIt(n, () => { row.classList.toggle('rowhot', (x = !x)); getComputedStyle(cell).color })
+  },
+  // 单格编辑（改文本 → 强制 reflow）：auto 表格 vs fixed vs div vs 虚拟化的失效范围对比
+  mutateCell: (n = 3) => {
+    const cell = firstDataCell(); if (!cell) return null
+    const i = 10, j = 0, a = cellText(i, j), b = a + '✱'
+    let x = false
+    return timeIt(n, () => { cell.textContent = (x = !x) ? b : a; void scroller.offsetHeight })
+  },
+  // 命中测试：视口内随机点 elementFromPoint
+  hitTest: (n = 30) => {
+    const r = scroller.getBoundingClientRect()
+    return timeIt(n, (i) => {
+      const x = r.left + ((i * 7919) % Math.max(1, r.width - 20)) + 10
+      const y = r.top + ((i * 104729) % Math.max(1, r.height - 20)) + 10
+      void document.elementFromPoint(x, y)?.className
+    })
+  },
+  // 不连续滚动：单跳到尾 + 双 rAF 结算（主线程追平耗时）
+  jumpEnd: async () => {
+    const t0 = performance.now()
+    scroller.scrollTop = 1e9
+    await raf2()
+    return { ms: +(performance.now() - t0).toFixed(1), scrollTop: Math.round(scroller.scrollTop) }
+  },
+  // 连续滚动（程序化 rAF——主线程同步滚动，只测主线程/软光栅，方向性参考）
+  fling: (px = 1500, frames = 180) => new Promise((resolve) => {
+    scroller.scrollTop = 0
+    const dt = []; let f = 0, last = 0, stop = false
+    const step = (now) => {
+      if (stop) return
+      if (last) dt.push(now - last)
+      last = now; f++
+      scroller.scrollTop = Math.min(scroller.scrollTop + px, scroller.scrollHeight)
+      if (f < frames && scroller.scrollTop < scroller.scrollHeight - scroller.clientHeight - 1) requestAnimationFrame(step)
+      else { stop = true; resolve({ ...stat(dt), fps: +(1000 * f / (dt.reduce((a, b) => a + b, 0) || 16)).toFixed(1), frames: f, ...B.vstats() }) }
+    }
+    requestAnimationFrame((n) => { last = n; requestAnimationFrame(step) })
+  }),
+  vstats: () => (V ? { mounts: V.stats.mounts, rebinds: V.stats.rebinds, assignMs: +V.stats.assignMs.toFixed(1) } : {}),
+  vreset: () => { if (V) V.stats = { mounts: V.stats.mounts, rebinds: 0, assignMs: 0 } },
+  stats: () => ({
+    nodes: document.getElementsByTagName('*').length,
+    heapMB: performance.memory ? +(performance.memory.usedJSHeapSize / 1048576).toFixed(1) : null,
+    mode, scrollTop: Math.round(scroller?.scrollTop ?? 0),
+  }),
+}
+window.__bench = B
+
+// ———————————————— UI 接线 ————————————————
+const logEl = $('#log')
+const log = (tag, v) => {
+  const line = `[${new Date().toTimeString().slice(0, 8)}] ${tag} ${typeof v === 'object' ? JSON.stringify(v) : v}`
+  logEl.textContent = (logEl.textContent.split('\n').slice(-199).concat(line)).join('\n')
+  $('#status').textContent = tag
+}
+$('#b-build').onclick = async () => {
+  $('#status').textContent = '构建中…'
+  const r = await B.build({
+    rows: +$('#rows').value, cols: +$('#cols').value, mode: $('#mode').value,
+    method: $('#method').value, cv: $('#cv').checked,
+  })
+  log('build', r)
+}
+$('#b-destroy').onclick = () => { B.destroy(); log('destroy', 'ok') }
+for (const btn of document.querySelectorAll('[data-b]')) {
+  btn.onclick = async () => {
+    const fn = btn.dataset.b
+    try { log(fn, await B[fn]()) } catch (e) { log(fn + ' ERROR', e.message) }
+  }
+}
+// 手动玩时暴露 gc（--js-flags=--expose-gc 下有效）
+window.__vGc = () => { try { window.gc && window.gc() } catch {} }
+</script>
+</body>
+</html>
